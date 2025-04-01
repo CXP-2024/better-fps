@@ -6,6 +6,11 @@ __pycache__/
 # C extensions
 *.so
 
+## some directory
+visualization_frames/
+halved_visualization_frames/
+average_visualization_frames/
+
 # Distribution / packaging
 .Python
 build/

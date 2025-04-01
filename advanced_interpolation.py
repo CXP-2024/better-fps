@@ -17,6 +17,10 @@ def detect_occlusions(flow_forward, flow_backward, threshold=0.5):
     pos_x = x_coords + flow_forward[:,:,0]
     pos_y = y_coords + flow_forward[:,:,1]
     
+    # Bound checking for warped positions
+    pos_x = np.clip(pos_x, 0, w-1)
+    pos_y = np.clip(pos_y, 0, h-1)
+    
     # Sample backward flow at warped positions (bilinear interpolation)
     back_flow_x = cv2.remap(flow_backward[:,:,0], pos_x, pos_y, cv2.INTER_LINEAR)
     back_flow_y = cv2.remap(flow_backward[:,:,1], pos_x, pos_y, cv2.INTER_LINEAR)
@@ -28,10 +32,21 @@ def detect_occlusions(flow_forward, flow_backward, threshold=0.5):
     # Occlusion map based on forward-backward consistency
     occlusion_map = (diff_x*diff_x + diff_y*diff_y) > threshold
     
-    return occlusion_map
+    # Also consider flow magnitude - high magnitude areas are often problematic
+    flow_mag = get_flow_magnitude(flow_forward)
+    high_motion_areas = flow_mag > np.percentile(flow_mag, 95)  # Top 5% of motion
+    
+    # Combine both criteria
+    refined_occlusion = np.logical_or(occlusion_map, high_motion_areas)
+    
+    # Apply morphological operations to clean up the occlusion map
+    kernel = np.ones((3, 3), np.uint8)
+    refined_occlusion = cv2.morphologyEx(refined_occlusion.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+    
+    return refined_occlusion.astype(bool)
 
-def advanced_frame_interpolation(frame1, frame2, num_intermediate=1):
-    """Generate multiple intermediate frames with occlusion handling."""
+def advanced_frame_interpolation(frame1, frame2, num_intermediate=1, occlusion_threshold=0.5):
+    """Generate multiple intermediate frames with improved occlusion handling."""
     # Calculate forward and backward flows
     flow_forward = cv2.calcOpticalFlowFarneback(
         cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY),
@@ -45,9 +60,9 @@ def advanced_frame_interpolation(frame1, frame2, num_intermediate=1):
         None, 0.5, 3, 15, 3, 5, 1.2, 0
     )
     
-    # Detect occlusions
-    occlusion_forward = detect_occlusions(flow_forward, flow_backward)
-    occlusion_backward = detect_occlusions(flow_backward, flow_forward)
+    # Detect occlusions with custom threshold
+    occlusion_forward = detect_occlusions(flow_forward, flow_backward, threshold=occlusion_threshold)
+    occlusion_backward = detect_occlusions(flow_backward, flow_forward, threshold=occlusion_threshold)
     
     # Generate intermediate frames
     intermediate_frames = []
@@ -62,31 +77,51 @@ def advanced_frame_interpolation(frame1, frame2, num_intermediate=1):
         h, w = frame1.shape[:2]
         y_coords, x_coords = np.mgrid[0:h, 0:w].astype(np.float32)
         
-        # Warping coordinates
-        pos1_x = x_coords - forward_t[:,:,0]
-        pos1_y = y_coords - forward_t[:,:,1]
+        # Warping coordinates with bounds checking
+        pos1_x = np.clip(x_coords - forward_t[:,:,0], 0, w-1)
+        pos1_y = np.clip(y_coords - forward_t[:,:,1], 0, h-1)
         
-        pos2_x = x_coords + backward_t[:,:,0]
-        pos2_y = y_coords + backward_t[:,:,1]
+        pos2_x = np.clip(x_coords + backward_t[:,:,0], 0, w-1)
+        pos2_y = np.clip(y_coords + backward_t[:,:,1], 0, h-1)
         
         # Warp frames
-        warped1 = cv2.remap(frame1, pos1_x, pos1_y, cv2.INTER_LINEAR)
-        warped2 = cv2.remap(frame2, pos2_x, pos2_y, cv2.INTER_LINEAR)
+        warped1 = cv2.remap(frame1, pos1_x, pos1_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        warped2 = cv2.remap(frame2, pos2_x, pos2_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
         
-        # Account for occlusions
-        weights1 = (1 - t) * np.expand_dims(~occlusion_forward, axis=2)
-        weights2 = t * np.expand_dims(~occlusion_backward, axis=2)
+        # Dynamic weighting based on time value and distance from occlusion
+        # This creates smoother weight transitions near occlusions
+        weight1 = 1 - t
+        weight2 = t
         
-        sum_weights = weights1 + weights2
-        sum_weights[sum_weights == 0] = 1  # Avoid division by zero
+        # Reduce weights in occluded regions
+        occlusion_dilated_forward = cv2.dilate(occlusion_forward.astype(np.uint8), np.ones((5, 5), np.uint8))
+        occlusion_dilated_backward = cv2.dilate(occlusion_backward.astype(np.uint8), np.ones((5, 5), np.uint8))
         
-        # Blend frames using calculated weights
-        interpolated = (warped1 * weights1 + warped2 * weights2) / sum_weights
-        intermediate_frames.append(interpolated.astype(np.uint8))
+        weight1 = weight1 * (1 - occlusion_dilated_forward.astype(float) * 0.8)
+        weight2 = weight2 * (1 - occlusion_dilated_backward.astype(float) * 0.8)
+        
+        # Ensure weights sum up to 1 for proper blending
+        weight_sum = weight1 + weight2
+        weight_sum[weight_sum < 0.1] = 0.1  # Avoid division by very small numbers
+        
+        weight1 = weight1 / weight_sum
+        weight2 = weight2 / weight_sum
+        
+        # Apply weights to frames
+        weight1 = np.expand_dims(weight1, axis=2)
+        weight2 = np.expand_dims(weight2, axis=2)
+        
+        # Blend frames
+        interpolated = (warped1 * weight1 + warped2 * weight2).astype(np.uint8)
+        
+        # Apply bilateral filter to smooth artifacts while preserving edges
+        interpolated = cv2.bilateralFilter(interpolated, 5, 75, 75)
+        
+        intermediate_frames.append(interpolated)
     
     return intermediate_frames
 
-def increase_video_fps(input_path, output_path, target_multiplier=2):
+def increase_video_fps(input_path, output_path, target_multiplier=2, occlusion_threshold=0.5):
     """Increase video FPS by a specified multiplier using advanced interpolation."""
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -121,8 +156,9 @@ def increase_video_fps(input_path, output_path, target_multiplier=2):
         if not ret:
             break
         
-        # Generate intermediate frames
-        intermediate_frames = advanced_frame_interpolation(prev_frame, curr_frame, num_intermediate)
+        # Generate intermediate frames with custom occlusion threshold
+        intermediate_frames = advanced_frame_interpolation(
+            prev_frame, curr_frame, num_intermediate, occlusion_threshold)
         
         # Write intermediate frames
         for frame in intermediate_frames:
@@ -149,6 +185,8 @@ if __name__ == "__main__":
     parser.add_argument("input", help="Input video file path")
     parser.add_argument("output", help="Output video file path")
     parser.add_argument("--multiplier", type=int, default=2, help="FPS multiplier (default: 2)")
+    parser.add_argument("--occlusion", type=float, default=0.5, 
+                        help="Occlusion detection threshold (default: 0.5, lower for fewer artifacts)")
     args = parser.parse_args()
     
-    increase_video_fps(args.input, args.output, args.multiplier)
+    increase_video_fps(args.input, args.output, args.multiplier, args.occlusion)
