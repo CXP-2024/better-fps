@@ -10,6 +10,10 @@ __pycache__/
 visualization_frames/
 halved_visualization_frames/
 average_visualization_frames/
+dl_viz_results/
+rife_model/
+video/
+train_log/
 
 # Distribution / packaging
 .Python
